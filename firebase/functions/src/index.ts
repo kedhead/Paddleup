@@ -1490,7 +1490,7 @@ export const onDmMessageCreate = onDocumentCreated(
   async (event) => {
     const { threadId } = event.params;
     const message = event.data?.data() as
-      | { authorId: string; authorName: string; content: string }
+      | { authorId: string; authorName: string; content: string; mediaType?: string }
       | undefined;
     if (!message) return;
 
@@ -1503,7 +1503,14 @@ export const onDmMessageCreate = onDocumentCreated(
     const recipients = participants.filter((uid) => uid !== message.authorId);
     if (recipients.length === 0) return;
 
-    const body = message.content.length > 0 ? message.content.slice(0, 200) : "Sent a message";
+    // A photo sent without a caption has no content at all, so say what it is
+    // rather than the generic fallback.
+    const body =
+      message.content.length > 0
+        ? message.content.slice(0, 200)
+        : message.mediaType === "photo"
+          ? "📷 Sent a photo"
+          : "Sent a message";
 
     for (const userId of recipients) {
       const userRef = db.doc(`users/${userId}`);
@@ -1570,6 +1577,82 @@ export const onDmMessageCreate = onDocumentCreated(
 // here; this is the only place thread creation can happen, so it is the right
 // choke point.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// uploadDmMedia — attach a photo to a direct message.
+//
+// Same shape and reasoning as uploadChannelMedia: React Native has no Blob, so
+// the client can't write to Storage directly, and routing it through here also
+// puts the thread-participant check server-side. Images only — the callable
+// payload cap (~7 MB after base64 inflation) makes video impractical.
+//
+// The message doc is updated with the Admin SDK, which is what allows it: the
+// Firestore rule deliberately lets participants change nothing but `reactions`
+// on a message, so the client could not attach media itself.
+// ---------------------------------------------------------------------------
+export const uploadDmMedia = onCall({ memory: "512MiB" }, async (request) => {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Sign-in required");
+
+  const { threadId, messageId, base64, contentType, fileKey } = request.data ?? {};
+  if (
+    typeof threadId !== "string" ||
+    typeof messageId !== "string" ||
+    typeof base64 !== "string" ||
+    typeof contentType !== "string"
+  ) {
+    throw new HttpsError("invalid-argument", "Missing upload fields");
+  }
+  if (!/^image\//.test(contentType)) {
+    throw new HttpsError("invalid-argument", "Direct messages accept images only");
+  }
+  const key: string = typeof fileKey === "string" ? fileKey : "media";
+  if (!/^media(-\d{1,2})?$/.test(key)) {
+    throw new HttpsError("invalid-argument", "Bad fileKey");
+  }
+
+  const db = getFirestore();
+  const threadSnap = await db.doc(`dms/${threadId}`).get();
+  if (!threadSnap.exists) throw new HttpsError("not-found", "Thread not found");
+  const participants = (threadSnap.data()?.participants as string[] | undefined) ?? [];
+  if (!participants.includes(uid)) {
+    throw new HttpsError("permission-denied", "Not a participant in this thread");
+  }
+
+  const msgRef = db.doc(`dms/${threadId}/messages/${messageId}`);
+  const msgSnap = await msgRef.get();
+  if (!msgSnap.exists) throw new HttpsError("not-found", "Message not found");
+  if ((msgSnap.data() as { authorId?: string } | undefined)?.authorId !== uid) {
+    throw new HttpsError("permission-denied", "Not your message");
+  }
+
+  const buffer = Buffer.from(base64, "base64");
+  if (buffer.length > 7 * 1024 * 1024) {
+    throw new HttpsError("invalid-argument", "Photo too large (max ~7 MB)");
+  }
+
+  const ext = contentType.split("/")[1] || "jpg";
+  const path = `dms/${threadId}/${messageId}/${key}.${ext}`;
+  const token = crypto.randomUUID();
+  const bucket = getStorage().bucket();
+
+  await bucket.file(path).save(buffer, {
+    contentType,
+    metadata: { metadata: { firebaseStorageDownloadTokens: token } },
+  });
+
+  const mediaUrl =
+    `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/` +
+    `${encodeURIComponent(path)}?alt=media&token=${token}`;
+
+  if (key === "media") {
+    await msgRef.update({ mediaUrl, mediaStoragePath: `gs://${bucket.name}/${path}` });
+  } else {
+    await msgRef.update({ mediaUrls: FieldValue.arrayUnion(mediaUrl) });
+  }
+
+  return { mediaUrl };
+});
+
 export const openDmThread = onCall(async (request) => {
   const uid = request.auth?.uid;
   if (!uid) throw new HttpsError("unauthenticated", "Sign-in required");

@@ -15,6 +15,7 @@ import {
   where,
 } from "firebase/firestore";
 import { httpsCallable } from "firebase/functions";
+import * as FileSystem from "expo-file-system/legacy";
 import { db, functions } from "./firebase";
 import type { DmMessage, DmThread } from "@/models/club";
 
@@ -80,6 +81,7 @@ export async function sendDmMessage(
   displayName: string,
   content: string,
   replyTo?: DmMessage["replyTo"],
+  opts: { mediaType?: "photo" } = {},
 ): Promise<DmMessage> {
   const now = new Date().toISOString();
   const msg: Omit<DmMessage, "id"> = {
@@ -88,15 +90,46 @@ export async function sendDmMessage(
     authorId: uid,
     authorName: displayName,
     ...(replyTo ? { replyTo } : {}),
+    ...(opts.mediaType ? { mediaType: opts.mediaType } : {}),
     createdAt: now,
   };
   const ref = await addDoc(collection(db, "dms", threadId, "messages"), msg);
   // Keeps the thread list ordered and previewable without reading messages.
+  // A photo with no caption would otherwise leave the thread list blank.
+  const preview = content.trim()
+    ? content.slice(0, 80)
+    : opts.mediaType === "photo"
+      ? "📷 Photo"
+      : "";
   void updateDoc(doc(db, "dms", threadId), {
     lastMessageAt: now,
-    lastMessagePreview: content.slice(0, 80),
+    lastMessagePreview: preview,
   }).catch(() => undefined);
   return { ...msg, id: ref.id };
+}
+
+/**
+ * Attach a photo to a direct message. Goes through a Cloud Function for the
+ * same reasons as club chat media: React Native has no Blob, and the Firestore
+ * rule lets a participant change nothing but `reactions` on a message, so the
+ * media fields have to be written server-side.
+ */
+export async function uploadDmMedia(
+  threadId: string,
+  messageId: string,
+  localUri: string,
+  mimeType: string,
+  fileKey: string = "media",
+): Promise<string> {
+  const base64 = await FileSystem.readAsStringAsync(localUri, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+  const fn = httpsCallable<
+    { threadId: string; messageId: string; base64: string; contentType: string; fileKey?: string },
+    { mediaUrl: string }
+  >(functions, "uploadDmMedia");
+  const { data } = await fn({ threadId, messageId, base64, contentType: mimeType, fileKey });
+  return data.mediaUrl;
 }
 
 export async function toggleDmReaction(

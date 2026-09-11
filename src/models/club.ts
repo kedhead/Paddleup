@@ -545,6 +545,13 @@ export interface DmMessage {
   authorName: string;
   reactions?: Record<string, string[]>;
   replyTo?: { messageId: string; authorName: string; preview: string };
+  /** Photo attachments, mirroring ClubMessage: a single photo lands on
+   *  mediaUrl, several on mediaUrls (rendered as a grid). Images only — the
+   *  callable upload's payload cap makes video impractical here. */
+  mediaUrl?: string;
+  mediaUrls?: string[];
+  mediaStoragePath?: string;
+  mediaType?: "photo";
   createdAt: string;
 }
 
