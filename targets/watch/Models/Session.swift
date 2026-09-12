@@ -64,7 +64,7 @@ struct WatchSideSwitch: Codable {
     let source: String
 }
 
-struct WatchTrackPoint: Codable {
+struct WatchTrackPoint: Codable, Sendable {
     let t: Double
     let lat: Double
     let lon: Double

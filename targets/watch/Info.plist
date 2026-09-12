@@ -4,6 +4,20 @@
 <dict>
 	<key>WKApplication</key>
 	<true/>
+	<!-- REQUIRED for a workout app. Without it watchOS suspends this app the
+	     moment it leaves the foreground — wrist down, an arriving message, the
+	     screen sleeping — which stops GPS, the accelerometer and the duration
+	     timer, and lets the system terminate the app outright under memory
+	     pressure. An HKWorkoutSession does NOT grant background runtime on its
+	     own; this key is what does. Its absence is why a paddle died partway
+	     through and came back on the craft picker with the workout stranded in
+	     HealthKit and no way to end it. -->
+	<key>WKBackgroundModes</key>
+	<array>
+		<string>workout-processing</string>
+	</array>
+	<key>NSMotionUsageDescription</key>
+	<string>ImuaTrak uses the watch's motion sensors to count your strokes and measure stroke rate while you paddle.</string>
 	<key>NSHealthShareUsageDescription</key>
 	<string>ImuaTrak reads your heart rate during a paddling workout to show live effort and heart-rate zones.</string>
 	<key>NSHealthUpdateUsageDescription</key>

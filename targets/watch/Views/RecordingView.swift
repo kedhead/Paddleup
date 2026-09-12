@@ -52,7 +52,10 @@ struct RecordingView: View {
             Button("Stop & Save", role: .destructive) {
                 Task {
                     await workoutManager.stopAndSave()
-                    path.append("summary")
+                    // Replace rather than append: the recording screen is no
+                    // longer a route on this path, and a workout started by
+                    // Siri may have left the path empty entirely.
+                    path = NavigationPath(["summary"])
                 }
             }
             Button("Discard", role: .destructive) {
@@ -222,7 +225,6 @@ private struct LiveMapPage: View {
         Map(coordinateRegion: $region, annotationItems: wm.coordinates.last.map { [MapPin(coord: $0)] } ?? []) { pin in
             MapMarker(coordinate: pin.coord, tint: .imuaAqua)
         }
-        .overlay(MapPolylineOverlay(coords: wm.coordinates))
         // CLLocationCoordinate2D isn't Equatable, so observe the array count
         // and re-center on the latest fix whenever a new point lands.
         .onChange(of: wm.coordinates.count) { _ in
@@ -232,17 +234,12 @@ private struct LiveMapPage: View {
     }
 }
 
+// The id is derived from the coordinate, not a fresh UUID per init: the
+// annotation array is rebuilt on every render, and a new identity each time
+// made MapKit tear the marker down and re-add it many times a second.
 struct MapPin: Identifiable {
-    let id = UUID()
     let coord: CLLocationCoordinate2D
-}
-
-// Simple overlay for the live route polyline on watchOS
-struct MapPolylineOverlay: View {
-    let coords: [CLLocationCoordinate2D]
-    // On watchOS, MapKit supports MKPolylineRenderer natively via UIViewRepresentable
-    // but for simplicity we skip the overlay in MVP and rely on the position marker.
-    var body: some View { EmptyView() }
+    var id: String { "\(coord.latitude),\(coord.longitude)" }
 }
 
 // ── Shared metric row ─────────────────────────────────────────────────────────

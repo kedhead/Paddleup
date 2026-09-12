@@ -45,6 +45,20 @@ final class WorkoutManager: NSObject, ObservableObject {
     private let motionManager = CMMotionManager()
     private let strokeDetector = StrokeDetector()
 
+    /// Serial, off-main queue for the 50 Hz accelerometer stream.
+    private let motionQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "app.imuatrak.watch.motion"
+        q.maxConcurrentOperationCount = 1
+        q.qualityOfService = .userInitiated
+        return q
+    }()
+
+    /// Serial queue for writing the recovery snapshot. Serial so a slow write
+    /// can never be overtaken by a newer one and leave stale state on disk.
+    private static let snapshotQueue = DispatchQueue(label: "app.imuatrak.watch.snapshot",
+                                                     qos: .utility)
+
     private var track: [WatchTrackPoint] = []
     private var sessionStartDate: Date?
     private var sessionId = ""
@@ -208,14 +222,32 @@ final class WorkoutManager: NSObject, ObservableObject {
         persistSnapshot(force: true)
     }
 
+    /// Accelerometer sampling runs at 50 Hz for the whole paddle. Delivering
+    /// that to `.main` put fifty DSP callbacks a second on the main thread and
+    /// left almost no headroom — once anything else on the main actor took real
+    /// time, watchOS's watchdog killed the app mid-session. It runs on its own
+    /// serial queue now and only hops to the main actor when a stroke actually
+    /// lands (about once a second).
     private func startAccelerometer() {
         guard motionManager.isAccelerometerAvailable else { return }
         motionManager.accelerometerUpdateInterval = 1.0 / 50.0
-        motionManager.startAccelerometerUpdates(to: .main) { [weak self] data, _ in
+        // Timebase captured by value so the handler never touches main-actor
+        // state just to know how far into the session it is. Re-captured on
+        // every resume, which is the only time pausedAccumSec changes while
+        // sampling is stopped.
+        let epoch = sessionStartEpoch + pausedAccumSec
+        let detector = strokeDetector
+        motionManager.startAccelerometerUpdates(to: motionQueue) { [weak self] data, _ in
             guard let self, let data else { return }
             let a = data.acceleration
-            let t = self.activeElapsedSec
-            if let stroke = self.strokeDetector.onSample(tSec: t, ax: a.x, ay: a.y, az: a.z) {
+            let t = Date().timeIntervalSince1970 - epoch
+            // Serial queue, so the detector's filter state is only ever touched
+            // from one thread.
+            guard let stroke = detector.onSample(tSec: t, ax: a.x, ay: a.y, az: a.z) else { return }
+            Task { @MainActor in
+                // A sample can still be in flight when the session ends; don't
+                // let it land on the next one's counters.
+                guard self.isRecording, !self.isPaused else { return }
                 self.strokeCount += 1
                 self.strokeRate = stroke.rateSpm
                 self.currentStrokeRate = stroke.rateSpm
@@ -311,7 +343,7 @@ final class WorkoutManager: NSObject, ObservableObject {
     // starting a new one — HealthKit refuses a second session — which is what
     // made the watch app appear to lock up. Re-attach instead of orphaning it.
 
-    private struct RecoverySnapshot: Codable {
+    private struct RecoverySnapshot: Codable, Sendable {
         var sessionId: String
         var startEpoch: Double
         var craft: String
@@ -347,14 +379,28 @@ final class WorkoutManager: NSObject, ObservableObject {
             distanceM: distanceM,
             track: track
         )
-        if let data = try? JSONEncoder().encode(snap) {
-            try? data.write(to: Self.snapshotURL, options: .atomic)
+        // Encoding the whole track and writing it out is O(track), and the
+        // track grows for the entire paddle. Doing that on the main actor cost
+        // a little more every ten seconds until, well into a session, the stall
+        // was long enough for watchOS to kill the app — which is why it died at
+        // a fairly consistent DISTANCE rather than at random. Hand it to a
+        // background queue; a snapshot landing a few milliseconds late costs
+        // nothing, and the main actor now only pays for the struct init.
+        let url = Self.snapshotURL
+        Self.snapshotQueue.async {
+            guard let data = try? JSONEncoder().encode(snap) else { return }
+            try? data.write(to: url, options: .atomic)
         }
     }
 
     private func clearSnapshot() {
         lastSnapshotAt = 0
-        try? FileManager.default.removeItem(at: Self.snapshotURL)
+        // Same queue as the writes, so a snapshot still in flight can't land
+        // after the delete and resurrect a session that has already ended.
+        let url = Self.snapshotURL
+        Self.snapshotQueue.async {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     private func loadSnapshot() -> RecoverySnapshot? {
