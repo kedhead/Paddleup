@@ -40,23 +40,25 @@ const googleIosUrlScheme = GOOGLE_IOS_CLIENT_ID
 // to the version of that build, in the same commit that produces it. Run
 // `npm run check:ota` to verify these against the builds EAS actually has.
 //
-// Both constants are set to 1.0.4 for the build produced from this commit.
-// Its headline native change is the watchOS workout recovery fix: watchOS was
-// terminating the watch app mid-paddle, and without recoverActiveWorkoutSession
-// the relaunched app came up on the craft picker with a live workout stranded
-// in HealthKit — which also blocked starting a new one, so tracking looked
-// locked up. The rest of the release is JS that ships inside this binary.
+// Both constants are set to 1.0.5 for the build produced from this commit.
+// Its headline native change is the watch app: 1.0.4's recovery fix was not
+// enough on its own, because the watch app had no `workout-processing` entry in
+// WKBackgroundModes at all — an HKWorkoutSession does not grant background
+// runtime by itself, so watchOS suspended the app whenever it left the
+// foreground and killed it under pressure. That is an Info.plist change, and
+// the rest of the watch work (the live screen no longer being a poppable
+// navigation route, the 50 Hz accelerometer and the snapshot write moved off
+// the main actor) is Swift. None of it can travel over OTA.
 //
-// ⚠️ Do NOT push an OTA (`eas update --channel production`) until 1.0.4 is
+// ⚠️ Do NOT push an OTA (`eas update --channel production`) until 1.0.5 is
 // LIVE and installed on each store: until then these runtimes point at a build
 // no device has, and an update would reach nobody — the #62 outage again.
-// (1.0.3 users keep the JS they already have; they get the rest by updating.)
-const IOS_RUNTIME_VERSION = "1.0.4";
+// (1.0.4 users keep the JS they already have; they get the rest by updating.)
+const IOS_RUNTIME_VERSION = "1.0.5";
 // Both platforms are built and submitted from this commit, so Android moves in
-// step with iOS. Android's own reason for the build is the keyboard fix: under
-// the enforced edge-to-edge of targetSdk 36 the window no longer resizes for
-// the IME, so inputs sat behind the keyboard.
-const ANDROID_RUNTIME_VERSION = "1.0.4";
+// step with iOS. Android has no native change of its own this cycle — it is
+// here to stay in line, and to carry the JS below in its binary.
+const ANDROID_RUNTIME_VERSION = "1.0.5";
 
 /** @type {import('expo/config').ExpoConfig} */
 const config = {
@@ -76,17 +78,17 @@ const config = {
   // harmless; bumping it is in fact required before any store submission.
   //
   // Because it is shared, every native build needs a number no store has seen:
-  // 1.0.3 shipped to both stores, so the next one starts at 1.0.4. Set that
+  // 1.0.4 shipped to both stores, so the next one starts at 1.0.5. Set that
   // platform's runtime constant above to whatever number you land on, in the
   // same commit.
   //
-  // 1.0.4 is the number for the build produced from this commit. The native
-  // reason for it is the watchOS fix: recovering the HKWorkoutSession when
-  // watchOS relaunches the watch app mid-paddle, which is not something an OTA
-  // can deliver. It also carries the JS accumulated since 1.0.3 went live
-  // (member profiles, RSVP markers on event cards, "maybe" paddlers in lineups,
-  // chat message editing, media captions).
-  version: "1.0.4",
+  // 1.0.5 is the number for the build produced from this commit. The native
+  // reason for it is the watch app — the missing workout-processing background
+  // mode, the recording screen no longer being a poppable navigation route, and
+  // the main-thread work that was getting the app watchdog-killed partway
+  // through a paddle. It also carries the JS accumulated since 1.0.4 (photo
+  // attachments in direct messages).
+  version: "1.0.5",
   orientation: "portrait",
   icon: "./assets/icon.png",
   // Every screen is styled with hardcoded light colors — there is no dark
