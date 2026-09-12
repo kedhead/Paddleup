@@ -66,9 +66,23 @@ rules keep watchOS from killing the app mid-paddle (it has, twice):
    the main actor only when a stroke lands) and the recovery snapshot, which
    JSON-encodes the entire track (`snapshotQueue`).
 
-If the app is killed anyway, `WorkoutManager.recoverIfNeeded()` re-attaches to
-the HKWorkoutSession HealthKit kept alive and restores the track from the
-snapshot.
+If the app is killed anyway, `WorkoutManager.recoverIfNeeded()` runs at launch
+and whenever the scene becomes active, and takes one of three paths:
+
+| What it finds | What it does |
+| --- | --- |
+| A live HKWorkoutSession | `attach` — re-adopt the session and restore the track from the snapshot. The paddle carries on as if nothing happened. |
+| No session, snapshot < 15 min old | `resumeWithoutHealthKit` — restore from the snapshot and start a **fresh** HKWorkoutSession for the rest of the paddle. Happens when the app died before HealthKit's one-time prompt was answered, or HealthKit ended the session on its own. |
+| No session, snapshot older | `salvage` — the paddle is over; assemble it from the snapshot and transfer it to the phone rather than deleting it. |
+
+Notes on the middle path: the new HealthKit session only covers the remainder,
+so Health/ring credit is partial, but the session that reaches the phone (track,
+distance, strokes, splits) is complete. It also matters that a session exists at
+all — `workout-processing` only keeps the app alive *while one is running*.
+
+`salvage` reuses the original session id, so a copy that somehow already made it
+to the phone is replaced rather than duplicated, and it ignores anything under
+100 m / 2 min so an accidental start doesn't litter the user's history.
 
 Separately, **`ContentView` derives the live screen from `isRecording` and does
 not put it in a `NavigationStack`.** As a pushed route it could be popped — by

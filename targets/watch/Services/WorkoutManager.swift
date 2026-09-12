@@ -170,7 +170,14 @@ final class WorkoutManager: NSObject, ObservableObject {
         // even start a new one while it's up. Don't attach to a dead run.
         guard isRecording, sessionId == startingSessionId else { return }
 
-        // Start HKWorkoutSession (powers GPS chip and HR sensor)
+        await beginHealthKitSession(startingAt: sessionStartDate!)
+    }
+
+    /// Start the HKWorkoutSession that powers the GPS chip and HR sensor — and,
+    /// just as importantly, is what keeps the app running in the background
+    /// (the `workout-processing` entitlement only applies while a session is
+    /// live). Shared with the snapshot-only recovery path.
+    private func beginHealthKitSession(startingAt date: Date) async {
         let config = HKWorkoutConfiguration()
         config.activityType = .paddleSports
         config.locationType = .outdoor
@@ -185,8 +192,8 @@ final class WorkoutManager: NSObject, ObservableObject {
             workoutSession = session
             builder = bldr
 
-            session.startActivity(with: sessionStartDate!)
-            try await bldr.beginCollection(at: sessionStartDate!)
+            session.startActivity(with: date)
+            try await bldr.beginCollection(at: date)
             // The user may have paused while the auth prompt was up.
             if isPaused { session.pause() }
         } catch {
@@ -352,7 +359,17 @@ final class WorkoutManager: NSObject, ObservableObject {
         var strokeCount: Int
         var distanceM: Double
         var track: [WatchTrackPoint]
+        /// When this snapshot was written. Optional so a snapshot from a build
+        /// that predates the field still decodes — it just reads as unknown,
+        /// which is treated as too old to resume.
+        var savedAt: Double?
     }
+
+    /// How recently the snapshot must have been written for recovery to pick the
+    /// paddle back up rather than close it out. Long enough for someone to
+    /// notice the watch died and reopen the app; short enough that a paddle
+    /// finished an hour ago never springs back to life.
+    private static let resumeWindowSec: Double = 15 * 60
 
     private static let snapshotURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory,
@@ -377,7 +394,8 @@ final class WorkoutManager: NSObject, ObservableObject {
             pauseStartedAtEpoch: pauseStartedAt?.timeIntervalSince1970,
             strokeCount: strokeCount,
             distanceM: distanceM,
-            track: track
+            track: track,
+            savedAt: now
         )
         // Encoding the whole track and writing it out is O(track), and the
         // track grows for the entire paddle. Doing that on the main actor cost
@@ -412,20 +430,99 @@ final class WorkoutManager: NSObject, ObservableObject {
     /// UI returns to the live screen and tracking simply carries on.
     func recoverIfNeeded() async {
         guard !isRecording else { return }
-        guard let session = await activeSession() else {
-            // Nothing live in HealthKit, so any snapshot belongs to a run that
-            // already finished — don't resurrect it.
-            clearSnapshot()
-            return
-        }
-        guard session.state == .running || session.state == .paused else {
+        let snap = loadSnapshot()
+
+        if let session = await activeSession() {
+            if session.state == .running || session.state == .paused {
+                attach(to: session, snapshot: snap)
+                return
+            }
             // Recovered a session that has already stopped: close it out so it
-            // can't block the next start.
+            // can't block the next start, then deal with the snapshot below —
+            // the paddle's own data is in there either way.
             session.end()
+        }
+
+        // Nothing live in HealthKit. That does NOT mean there was no paddle:
+        // the app can die before the HealthKit session ever starts (the
+        // one-time authorization prompt is still up), or HealthKit can end the
+        // session without us. The snapshot is the only record of those runs.
+        guard let snap else {
+            // Nothing to restore, or the file was unreadable — don't leave a
+            // corrupt one lying around to be retried forever.
             clearSnapshot()
             return
         }
-        attach(to: session)
+        let age = Date().timeIntervalSince1970 - (snap.savedAt ?? 0)
+        if age <= Self.resumeWindowSec {
+            await resumeWithoutHealthKit(snap)
+        } else {
+            await salvage(snap)
+        }
+    }
+
+    /// Pick a paddle back up with no HealthKit session behind it.
+    ///
+    /// A fresh HKWorkoutSession is started for the REMAINDER of the paddle —
+    /// not to recreate the lost one, but because it is what keeps the app alive
+    /// in the background and powers the HR sensor. The consequence is that the
+    /// workout written to Health (and the ring credit) covers only the part
+    /// after recovery, while the session that reaches the phone — track,
+    /// distance, strokes, splits — is complete.
+    private func resumeWithoutHealthKit(_ snap: RecoverySnapshot) async {
+        restore(from: snap)
+        isRecording = true
+        durationSec = activeElapsedSec
+        startDurationTimer()
+        if !isPaused {
+            locationManager.startUpdatingLocation()
+            startAccelerometer()
+        }
+        persistSnapshot(force: true)
+
+        let resumedId = sessionId
+        await requestAuthorization()
+        // The prompt can outlive the paddle — don't attach to a dead run.
+        guard isRecording, sessionId == resumedId else { return }
+        await beginHealthKitSession(startingAt: Date())
+    }
+
+    /// Too old to resume, but a real paddle happened. Assemble it from the
+    /// snapshot and send it to the phone rather than deleting it — losing the
+    /// session outright is the worse outcome, and reusing the original id means
+    /// a copy that somehow already made it across is replaced, not duplicated.
+    private func salvage(_ snap: RecoverySnapshot) async {
+        clearSnapshot()
+        // Don't resurrect an accidental start that ran for seconds; it would
+        // just litter the user's history.
+        guard snap.track.count >= 2,
+              snap.distanceM >= 100,
+              let last = snap.track.last, last.t >= 120 else { return }
+
+        let startDate = Date(timeIntervalSince1970: snap.startEpoch)
+        // Derived from the last fix rather than from savedAt, so the end time is
+        // when the paddle actually stopped producing data. Track timestamps are
+        // ACTIVE seconds, so paused time has to be added back to get wall clock.
+        let endDate = Date(timeIntervalSince1970: snap.startEpoch + last.t + snap.pausedAccumSec)
+
+        let session = WatchSession(
+            id: snap.sessionId,
+            userId: "",
+            schemaVersion: 1,
+            source: "ios-watch",
+            appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0",
+            craftType: snap.craft,
+            startedAt: ISO8601DateFormatter().string(from: startDate),
+            endedAt: ISO8601DateFormatter().string(from: endDate),
+            totals: Aggregator.totals(snap.track, strokeCount: snap.strokeCount),
+            hr: Aggregator.hrSummary(snap.track),
+            splits: Aggregator.splits(snap.track),
+            sideSwitches: [],
+            weather: nil,   // the moment has passed; weather is optional anyway
+            trackSummary: Aggregator.downsample(snap.track, maxPoints: 200),
+            isPublic: false
+        )
+        await TransferManager.shared.transferSession(session, fullTrack: snap.track)
     }
 
     private func activeSession() async -> HKWorkoutSession? {
@@ -436,7 +533,7 @@ final class WorkoutManager: NSObject, ObservableObject {
         }
     }
 
-    private func attach(to session: HKWorkoutSession) {
+    private func attach(to session: HKWorkoutSession, snapshot snap: RecoverySnapshot?) {
         let bldr = session.associatedWorkoutBuilder()
         bldr.dataSource = HKLiveWorkoutDataSource(healthStore: healthStore,
                                                    workoutConfiguration: session.workoutConfiguration)
@@ -447,8 +544,27 @@ final class WorkoutManager: NSObject, ObservableObject {
         // Collection began before the app died; calling beginCollection again
         // would throw, so it is deliberately not repeated here.
 
-        let snap = loadSnapshot()
-        let start = session.startDate
+        // HealthKit's own start date is authoritative when we have it — it
+        // survived the crash, the snapshot may be a few seconds behind.
+        restore(from: snap, start: session.startDate, paused: session.state == .paused)
+
+        isRecording = true
+        durationSec = activeElapsedSec
+        startDurationTimer()
+        if !isPaused {
+            locationManager.startUpdatingLocation()
+            startAccelerometer()
+        }
+        persistSnapshot(force: true)
+    }
+
+    /// Rebuild live state from a snapshot. Shared by both recovery paths: with
+    /// a HealthKit session behind it (`attach`) and without one
+    /// (`resumeWithoutHealthKit`).
+    private func restore(from snap: RecoverySnapshot?,
+                         start hkStart: Date? = nil,
+                         paused hkPaused: Bool? = nil) {
+        let start = hkStart
             ?? Date(timeIntervalSince1970: snap?.startEpoch ?? Date().timeIntervalSince1970)
         sessionId = snap?.sessionId ?? generateId()
         sessionStartDate = start
@@ -463,27 +579,22 @@ final class WorkoutManager: NSObject, ObservableObject {
         // above, so cadence simply re-converges over the next few strokes.
         strokeDetector.reset()
 
-        // Reconcile a pause that was in progress when the app died.
-        isPaused = (session.state == .paused)
+        // Reconcile a pause that was in progress when the app died. HealthKit
+        // knows whether the session is paused; without one, only the snapshot
+        // does.
+        isPaused = hkPaused ?? (snap?.pauseStartedAtEpoch != nil)
         if let startedAt = snap?.pauseStartedAtEpoch {
             if isPaused {
                 pauseStartedAt = Date(timeIntervalSince1970: startedAt)
             } else {
+                // HealthKit says running but the snapshot caught a pause: the
+                // user resumed during the gap, so bank that paused stretch.
                 pausedAccumSec += Date().timeIntervalSince1970 - startedAt
                 pauseStartedAt = nil
             }
         } else {
             pauseStartedAt = isPaused ? Date() : nil
         }
-
-        isRecording = true
-        durationSec = activeElapsedSec
-        startDurationTimer()
-        if !isPaused {
-            locationManager.startUpdatingLocation()
-            startAccelerometer()
-        }
-        persistSnapshot(force: true)
     }
 
     private func startDurationTimer() {
